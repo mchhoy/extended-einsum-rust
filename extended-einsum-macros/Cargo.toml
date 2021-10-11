@@ -1,0 +1,14 @@
+[package]
+name = "extended-einsum-macros"
+version = "0.1.0"
+authors = ["Michael Hoy <mch.hoy@gmail.com>"]
+edition = "2018"
+
+[lib]
+proc-macro = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+extended-einsum-macros-internal = {path = "../extended-einsum-macros-internal"}
+proc-macro2 = "1.0.29"

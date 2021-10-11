@@ -1,0 +1,7 @@
+
+[workspace]
+members = [
+    "extended-einsum",
+    "extended-einsum-macros",
+    "extended-einsum-macros-internal",
+]
