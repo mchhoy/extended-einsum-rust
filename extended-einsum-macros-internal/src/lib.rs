@@ -73,33 +73,66 @@ impl Parse for ShapeSpec {
     }
 }
 
+struct TermProduct {
+    terms: Vec<Term>,
+}
+
+impl Parse for TermProduct {
+    fn parse(stream: ParseStream) -> Result<Self> {
+        let mut terms = Vec::<Term>::new();
+
+        while true {
+            terms.push(stream.parse()?);
+
+            if !stream.lookahead1().peek(Token![*]) {
+                break;
+            }
+
+            stream.parse::<syn::BinOp>()?;
+        }
+
+        Ok(TermProduct { terms })
+    }
+}
+
 enum Node {
-    Op(Op),
-    Term(Term),
+    NonProductBinOp(NonProductBinOp),
+    TermProduct(TermProduct),
 }
 
 impl Parse for Node {
     fn parse(stream: ParseStream) -> Result<Self> {
         // TODO check https://docs.rs/syn/1.0.77/syn/parse/index.html
 
-        let first_term: Term = stream.parse()?;
+        let orig_stream = stream.fork();
 
-        if stream.fork().parse::<syn::BinOp>().is_ok() {
-            Ok(Node::Op(Op {
+        let first_term: TermProduct = stream.parse()?;
+
+        let is_mul_op = stream.lookahead1().peek(Token![*]);
+
+        let operation_type = stream.parse::<syn::BinOp>();
+
+        if operation_type.is_err() || is_mul_op {
+            Ok(Node::TermProduct(orig_stream.parse()?))
+        } else {
+            Ok(Node::NonProductBinOp(NonProductBinOp {
                 // TODO implement a better parser logic here
-                lhs: Box::new(Node::Term(first_term)),
-                op: stream.parse()?,
+                lhs: Box::new(Node::TermProduct(
+                    first_term,
+                )),
+                operation_type: operation_type?,
                 rhs: Box::new(stream.parse()?),
             }))
-        } else {
-            Ok(Node::Term(first_term))
         }
     }
 }
 
-struct Op {
+struct NonProductBinOp {
     lhs: Box<Node>,
-    op: syn::BinOp,
+
+    // Need to manually ensure this is not a product operation, which is handled distinctly.
+    operation_type: syn::BinOp,
+
     rhs: Box<Node>,
 }
 
@@ -113,12 +146,16 @@ impl<'a> IntoIterator for &'a Node {
             v: &mut Vec<&'a Term>,
         ) {
             match tree {
-                Node::Term(term) => {
-                    v.push(&term);
+                Node::TermProduct(term_product) => {
+                    for term in term_product.terms.iter() {
+                        v.push(&term);
+                    }
                 }
-                Node::Op(op) => {
-                    append(&op.lhs, v);
-                    append(&op.rhs, v);
+                Node::NonProductBinOp(
+                    non_product_bin_op,
+                ) => {
+                    append(&non_product_bin_op.lhs, v);
+                    append(&non_product_bin_op.rhs, v);
                 }
             }
         }
@@ -134,48 +171,101 @@ impl<'a> IntoIterator for &'a Node {
 impl Node {
     fn render_template(
         &self,
-        removed_dims: &Vec<&Ident>,
+        output_dims: &Vec<&Ident>,
     ) -> proc_macro2::TokenStream {
         match self {
-            Node::Op(op) => {
-                let op_token = op.op;
+            Node::NonProductBinOp(non_product_bin_op) => {
+                let op_token =
+                    non_product_bin_op.operation_type;
 
-                let lhs_tokens =
-                    op.lhs.render_template(removed_dims);
-                let rhs_tokens =
-                    op.rhs.render_template(removed_dims);
+                let lhs_tokens = non_product_bin_op
+                    .lhs
+                    .render_template(output_dims);
+
+                let rhs_tokens = non_product_bin_op
+                    .rhs
+                    .render_template(output_dims);
 
                 quote! {
-                    #lhs_tokens #op_token #rhs_tokens
+                    let lhs_accum = { #lhs_tokens };
+                    let rhs_accum = { #rhs_tokens };
+
+                    lhs_accum #op_token rhs_accum
                 }
             }
 
-            Node::Term(term) => {
-                let array_name = &term.array_name;
+            Node::TermProduct(term_product) => {
+                let mut term_product_expression = quote! {};
 
-                let paren_fields = term
-                    .paren_fields
-                    .iter()
-                    .map(|x| format_ident!("{}_index", x));
+                for (i_term, term) in
+                    term_product.terms.iter().enumerate()
+                {
+                    let array_name = &term.array_name;
 
-                let mut divider = quote! { 1.0 };
+                    let paren_fields =
+                        term.paren_fields.iter().map(|x| {
+                            format_ident!("{}_index", x)
+                        });
 
-                for removed_dim in removed_dims.iter() {
-                    if !term
-                        .paren_fields
-                        .iter()
-                        .contains(removed_dim)
-                    {
-                        let len = format_ident!(
-                            "{}_length",
-                            removed_dim
-                        );
-
-                        divider = quote! { #divider * (#len as f32) };
+                    if i_term == 0 {
+                        term_product_expression = quote! {#array_name[[#(#paren_fields),*]]}
+                    } else {
+                        term_product_expression = quote! {
+                        #term_product_expression * #array_name[[#(#paren_fields),*]]
+                        }
                     }
                 }
 
-                quote! {(#array_name[[#(#paren_fields),*]] / (#divider))}
+                term_product_expression = quote! {
+                    term_product_accum += #term_product_expression;
+                };
+
+                let all_axis_symbols: Vec<&Ident> =
+                    term_product
+                        .terms
+                        .iter()
+                        .map(|x| x.paren_fields.iter())
+                        .flatten()
+                        .unique()
+                        .collect();
+
+                let removed_dims: Vec<&Ident> =
+                    all_axis_symbols
+                        .iter()
+                        .filter(|&x| {
+                            !output_dims.contains(x)
+                        })
+                        .cloned()
+                        .collect();
+
+                for axis_symbol in removed_dims.iter() {
+                    let axis_index_variable = format_ident!(
+                        "{}_index",
+                        axis_symbol
+                    );
+
+                    let axis_length_variable = format_ident!(
+                        "{}_length",
+                        axis_symbol
+                    );
+
+                    term_product_expression = quote! {
+
+                        for #axis_index_variable in 0..#axis_length_variable {
+                            #term_product_expression
+                        }
+
+
+                    };
+                }
+
+                return quote! {
+                   let mut term_product_accum = 0f32;
+
+                    #term_product_expression
+
+                    term_product_accum
+                };
             }
         }
     }
@@ -232,12 +322,6 @@ fn process_ein_line(
 
     let output_dims: Vec<&Ident> =
         line.shape_spec.paren_fields.iter().collect();
-
-    let removed_dims: Vec<&Ident> = all_axis_symbols
-        .iter()
-        .filter(|&x| !output_dims.contains(x))
-        .cloned()
-        .collect();
 
     let mut array_bounds_checks = Vec::new();
 
@@ -333,15 +417,15 @@ fn process_ein_line(
 
     let rendered_expression = line
         .root_expression_node
-        .render_template(&removed_dims);
+        .render_template(&output_dims);
 
     let mut loop_contents = quote! {
-        result[[#(#axes),*]] += #rendered_expression;
+        result[[#(#axes),*]] = { #rendered_expression };
     };
 
     // Step 4: Add for loops for all the variables in the expression
 
-    for axis_symbol in all_axis_symbols.iter() {
+    for axis_symbol in output_dims.iter() {
         let axis_index_variable =
             format_ident!("{}_index", axis_symbol);
 

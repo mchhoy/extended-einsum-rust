@@ -52,6 +52,12 @@ mod tests {
 
         assert_eq!(result, result_expected);
 
+        let c = nd::array![[13., 0.], [14., 0.]];
+
+        let result = ein! { a[D1, D2] * b[D2, D3] + c[D3, D4] ~ [D1, D3] };
+
+        assert_eq!(result, result_expected);
+
         // TODO add check with wrong dims raises error
 
         // let b = ein!{ A[D1, *] * B[D1, D1] ~ [*]}
